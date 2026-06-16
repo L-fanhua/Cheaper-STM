@@ -1,0 +1,15 @@
+{
+    "name": "AD5761",
+    "version": "1.0.0",
+    "description": "AD5761RBRUZ-RL7 16-bit 单通道双极性 DAC 驱动 (SPI)",
+    "keywords": "dac, ad5761, analog-devices, spi, voltage-output",
+    "authors": [
+        {
+            "name": "STM-FORESP32 Project",
+            "maintainer": true
+        }
+    ],
+    "license": "MIT",
+    "frameworks": "arduino",
+    "platforms": "espressif32"
+}
