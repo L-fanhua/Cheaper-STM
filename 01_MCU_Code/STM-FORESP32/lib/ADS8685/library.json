@@ -1,0 +1,15 @@
+{
+    "name": "ADS8685",
+    "version": "1.0.0",
+    "description": "ADS8685/ADS8686 16-bit 双通道同步采样 SAR ADC 驱动 (双 SDO 软件 SPI)",
+    "keywords": "adc, ads8685, ads8686, ti, sar, dual-sdo, spi",
+    "authors": [
+        {
+            "name": "STM-FORESP32 Project",
+            "maintainer": true
+        }
+    ],
+    "license": "MIT",
+    "frameworks": "arduino",
+    "platforms": "espressif32"
+}
