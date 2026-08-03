@@ -1,0 +1,178 @@
+/**
+ * @file AD5761.h
+ * @brief AD5761R/AD5721R 16/12-bit 单通道 DAC 驱动 (Arduino / ESP32)
+ *        支持 ±10V / 0~10V / ±5V / 0~5V / −2.5~+7.5V / ±3V / 0~16V / 0~20V
+ * @date 2026-07-23
+ *
+ * 24-bit 输入移位寄存器格式 (Table 8):
+ *   DB[23:21] = X X X        (无关位)
+ *   DB20      = 0             (固定为 0)
+ *   DB[19:16] = A3 A2 A1 A0  (命令/寄存器地址, Table 10)
+ *   DB[15:0]  = 16-bit 数据
+ *
+ * 上电/复位后: 输出通过 1kΩ 箝位至地, 缓冲器关断, ALERT=低。
+ * 必须写入控制寄存器 (命令 0x4) 才能解除箝位并使 ALERT 置高。
+ */
+
+#ifndef AD5761_H
+#define AD5761_H
+
+#include <Arduino.h>
+#include <SPI.h>
+
+/* ================================================================== *
+ *  命令编码 (DB[19:16], Table 10)
+ * ================================================================== */
+#define AD5761_CMD_NOP                       0x0  ///< 无操作
+#define AD5761_CMD_WRITE_INPUT_REGISTER      0x1  ///< 写入输入寄存器(不更新输出)
+#define AD5761_CMD_UPDATE_DAC_REGISTER       0x2  ///< 从输入寄存器更新DAC寄存器
+#define AD5761_CMD_WRITE_AND_UPDATE_DAC      0x3  ///< 写入并更新 DAC 寄存器
+#define AD5761_CMD_WRITE_CONTROL_REGISTER    0x4  ///< 写控制寄存器
+#define AD5761_CMD_NOP_5                     0x5
+#define AD5761_CMD_NOP_6                     0x6
+#define AD5761_CMD_SOFTWARE_DATA_RESET       0x7  ///< 软件数据复位
+#define AD5761_CMD_RESERVED_8                0x8
+#define AD5761_CMD_DISABLE_DAISY_CHAIN       0x9
+#define AD5761_CMD_READBACK_INPUT_REGISTER   0xA  ///< 回读输入寄存器
+#define AD5761_CMD_READBACK_DAC_REGISTER     0xB  ///< 回读 DAC 寄存器
+#define AD5761_CMD_READBACK_CTRL_REGISTER    0xC  ///< 回读控制寄存器
+#define AD5761_CMD_NOP_D                     0xD
+#define AD5761_CMD_NOP_E                     0xE
+#define AD5761_CMD_SOFTWARE_FULL_RESET       0xF  ///< 软件完全复位
+
+/* ================================================================== *
+ *  控制寄存器位定义 (Table 11, Table 12)
+ * ================================================================== */
+#define AD5761_CTRL_CV(x)          (((uint32_t)(x) & 0x3) << 9)
+#define AD5761_CTRL_OVR            (1UL << 8)
+#define AD5761_CTRL_B2C            (1UL << 7)
+#define AD5761_CTRL_ETS            (1UL << 6)
+#define AD5761_CTRL_IRO            (1UL << 5)
+#define AD5761_CTRL_PV(x)          (((uint32_t)(x) & 0x3) << 3)
+#define AD5761_CTRL_RA(x)          (((uint32_t)(x) & 0x7) << 0)
+
+/* 回读控制寄存器中的状态位 (Table 15) */
+#define AD5761_STATUS_SC           (1U << 4)   ///< bit12 in 16-bit → 短路
+#define AD5761_STATUS_BO           (1U << 3)   ///< bit11 in 16-bit → 掉电/欠压
+
+#define AD5761_VOLT_ZERO           0x0
+#define AD5761_VOLT_MID            0x1
+#define AD5761_VOLT_FULL           0x2
+
+/**
+ * @brief 输出电压范围枚举 (RA[2:0], Table 12)
+ */
+enum AD5761_OutputRange {
+    RANGE_BIPOLAR_10V      = 0,
+    RANGE_UNIPOLAR_10V     = 1,
+    RANGE_BIPOLAR_5V       = 2,
+    RANGE_UNIPOLAR_5V      = 3,
+    RANGE_NEG2_5_POS7_5V   = 4,
+    RANGE_BIPOLAR_3V       = 5,
+    RANGE_UNIPOLAR_16V     = 6,
+    RANGE_UNIPOLAR_20V     = 7,
+};
+
+enum AD5761_ClearVoltage {
+    CLEAR_ZERO = 0x0,
+    CLEAR_MID  = 0x1,
+    CLEAR_FULL = 0x2,
+};
+
+/* ================================================================== *
+ *  单芯片驱动类
+ * ================================================================== */
+class AD5761 {
+    friend class AD5761Array;
+
+public:
+    AD5761(uint8_t csPin,
+           SPIClass &spi = SPI,
+           uint32_t spiFreq = 1000000UL,
+           int8_t ldacPin = -1,
+           int8_t clrPin = -1,
+           int8_t resetPin = -1);
+
+    bool begin(bool initSpiBus = true);
+    void hardwareReset();
+    void softwareReset();
+    bool setOutputRange(AD5761_OutputRange range, bool useInternalRef = true);
+    void enableInternalReference(bool enable);
+    bool setVoltage(float voltage);
+    void writeInputRegister(uint16_t code);
+    void writeAndUpdateDAC(uint16_t code);
+    void updateDAC();
+    void enableThermalShutdown(bool enable);
+    void enableOverrange(bool enable);
+    void setClearVoltage(AD5761_ClearVoltage cv);
+
+    /**
+     * @brief 回读控制寄存器 (命令 0xC), 用于诊断 SPI 通信和 ALERT 问题
+     *
+     * 回读协议 (Table 14/15): 发送命令 0xC 后, 在下一次 SPI 传输中
+     * 芯片通过 SDO 输出控制寄存器内容。本函数执行两次 24-bit 传输:
+     *   第 1 次: 发送回读请求 0xC, 忽略 SDO
+     *   第 2 次: 发送 NOP 0x0, 从 SDO 读取控制寄存器值
+     *
+     * @param outStatus [out] 状态位: bit1=SC(短路), bit0=BO(掉电), 0=正常
+     * @return 控制寄存器回读值; 若 SDO 未连接, 返回值不可靠
+     */
+    uint16_t readbackControlRegister(uint8_t *outStatus = nullptr);
+
+    uint16_t voltageToCode(float voltage) const;
+    float codeToVoltage(uint16_t code) const;
+    AD5761_OutputRange getOutputRange() const { return _range; }
+    void getRangeLimits(float &vMin, float &vMax) const;
+
+private:
+    SPIClass          &_spi;
+    SPISettings        _spiSettings;
+    uint8_t            _csPin;
+    int8_t             _ldacPin;
+    int8_t             _clrPin;
+    int8_t             _resetPin;
+    AD5761_OutputRange _range;
+    bool               _useIntRef;
+    uint32_t           _ctrlReg;
+
+    void writeRegister(uint8_t cmd, uint16_t data);
+    void writeControlRegister(uint32_t value);
+};
+
+/* ================================================================== *
+ *  多芯片管理类
+ * ================================================================== */
+class AD5761Array {
+public:
+    AD5761Array(const uint8_t *syncPins, uint8_t count,
+                SPIClass &spi = SPI,
+                uint32_t spiFreq = 1000000UL,
+                int8_t ldacPin = -1,
+                int8_t clrPin = -1,
+                int8_t resetPin = -1);
+    ~AD5761Array();
+    bool begin();
+    void hardwareResetAll();
+    void softwareResetAll();
+    void setOutputRangeAll(AD5761_OutputRange range, bool useInternalRef = true);
+    bool setOutputRange(uint8_t index, AD5761_OutputRange range, bool useInternalRef = true);
+    void setVoltageAll(float voltage);
+    void prepareVoltageAll(float voltage);
+    bool setVoltage(uint8_t index, float voltage);
+    bool prepareVoltage(uint8_t index, float voltage);
+    void setVoltages(const float *voltages);
+    void prepareVoltages(const float *voltages);
+    void latchAll();
+    uint8_t count() const { return _count; }
+    AD5761 *getDAC(uint8_t index);
+
+private:
+    AD5761 **_dacs;
+    uint8_t  _count;
+    int8_t   _ldacPin;
+    int8_t   _clrPin;
+    int8_t   _resetPin;
+    void pulseLDAC();
+};
+
+#endif /* AD5761_H */

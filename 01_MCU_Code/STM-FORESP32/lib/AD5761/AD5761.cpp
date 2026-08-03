@@ -1,373 +1,146 @@
 /**
  * @file AD5761.cpp
- * @brief AD5761RBRUZ-RL7 16-bit 单通道双极性 DAC 驱动实现
- *        含单芯片 AD5761 与多芯片 AD5761Array 实现
- * @date 2026-06-16
+ * @brief AD5761R/AD5721R 16/12-bit 单通道 DAC 驱动实现 (ESP-IDF 风格, 简单 C 接口)
+ * @date 2026-07-27
  */
 
 #include "AD5761.h"
 
-/* ================================================================== *
- *  单芯片驱动 AD5761 实现
- * ================================================================== */
-AD5761::AD5761(uint8_t csPin,
-               SPIClass &spi,
-               uint32_t spiFreq,
-               int8_t ldacPin,
-               int8_t clrPin,
-               int8_t resetPin)
-    : _spi(spi),
-      _spiSettings(spiFreq, MSBFIRST, SPI_MODE1),
-      _csPin(csPin),
-      _ldacPin(ldacPin),
-      _clrPin(clrPin),
-      _resetPin(resetPin),
-      _range(RANGE_BIPOLAR_10V),
-      _useIntRef(false) {
-}
+/* 创建 SPI 设备句柄 */
+spi_device_handle_t vspi_handle;
 
-bool AD5761::begin(bool initSpiBus) {
-    /* 配置片选引脚 (默认拉高,空闲状态) */
-    pinMode(_csPin, OUTPUT);
-    digitalWrite(_csPin, HIGH);
-
-    /* 配置 LDAC 引脚:默认拉低 = 透明模式(写入即更新) */
-    if (_ldacPin >= 0) {
-        pinMode(_ldacPin, OUTPUT);
-        digitalWrite(_ldacPin, LOW);
-    }
-
-    /* 配置 CLR 引脚:默认拉高(不清零) */
-    if (_clrPin >= 0) {
-        pinMode(_clrPin, OUTPUT);
-        digitalWrite(_clrPin, HIGH);
-    }
-
-    /* 配置 RESET 引脚:默认拉高(不复位) */
-    if (_resetPin >= 0) {
-        pinMode(_resetPin, OUTPUT);
-        digitalWrite(_resetPin, HIGH);
-    }
-
-    /* 仅在请求时初始化 SPI 总线(多芯片共享总线时避免重复初始化) */
-    if (initSpiBus) {
-        _spi.begin();
-    }
-
-    delay(10);
-    softwareReset();
-    delay(5);
-
-    return true;
-}
-
-void AD5761::hardwareReset() {
-    if (_resetPin < 0) return;
-    digitalWrite(_resetPin, LOW);
-    delayMicroseconds(100);   /* t_RESET 最小 100ns */
-    digitalWrite(_resetPin, HIGH);
-    delay(5);                 /* 物回内部寄存器稳定 */
-}
-
-void AD5761::softwareReset() {
-    /* 写入命令 0x5 + 特定数据 0x1234 触发软件复位 */
-    writeRegister(AD5761_CMD_SOFTWARE_RESET, AD5761_RESET_KEY);
-}
-
-bool AD5761::setOutputRange(AD5761_OutputRange range, bool useInternalRef) {
-    _range = range;
-    _useIntRef = useInternalRef;
-
-    uint32_t ctrl = 0;
-
-    /* 输出范围编码 OVENC (D8~D6) */
-    ctrl |= AD5761_CTRL_OVEN((uint32_t)range);
-
-    /* 双极性位:AD5761 中单极性模式 BIPOLAR=1,双极性 BIPOLAR=0 */
-    switch (range) {
-        case RANGE_UNIPOLAR_10V:
-        case RANGE_UNIPOLAR_5V:
-            ctrl |= AD5761_CTRL_BIPOLAR;   /* 单极性 */
+void ad5761_pull_up_ss(char cs) {
+    /* 拉高片选, 结束 SPI 传输 */
+    switch (cs) {
+        case 0:
+            gpio_set_level((gpio_num_t)csPin0, 1);
             break;
-        case RANGE_BIPOLAR_10V:
-        case RANGE_BIPOLAR_5V:
-        case RANGE_BIPOLAR_2_5V:
-        default:
-            /* 双极性: BIPOLAR 位保持 0 */
+
+        case 1:
+            gpio_set_level((gpio_num_t)csPin1, 1);
+            break;
+
+        case 2:
+            gpio_set_level((gpio_num_t)csPin2, 1);
+            break;
+
+        case 3:
+            gpio_set_level((gpio_num_t)csPin3, 1);
+            break;
+
+        case 4:
+            gpio_set_level((gpio_num_t)csPin0, 1);
+            gpio_set_level((gpio_num_t)csPin1, 1);
+            gpio_set_level((gpio_num_t)csPin2, 1);
+            gpio_set_level((gpio_num_t)csPin3, 1);
             break;
     }
-
-    /* 内部基准使能 */
-    if (useInternalRef) {
-        ctrl |= AD5761_CTRL_INTREF;
-    }
-
-    writeControlRegister(ctrl);
-    return true;
 }
 
-void AD5761::enableInternalReference(bool enable) {
-    _useIntRef = enable;
-    /* 通过专用命令快速切换内部基准 */
-    writeRegister(AD5761_CMD_SETUP_INTERNAL_REFERENCE, enable ? 0x0001 : 0x0000);
-}
+void ad5761_pull_down_ss(char cs) {
+    /* 拉低片选, 开始 SPI 传输 */
+    switch (cs) {
+        case 0:
+            gpio_set_level((gpio_num_t)csPin0, 0);
+            break;
 
-bool AD5761::setVoltage(float voltage) {
-    /* 钳位到当前输出范围 */
-    float vMin, vMax;
-    getRangeLimits(vMin, vMax);
-    if (voltage < vMin) voltage = vMin;
-    if (voltage > vMax) voltage = vMax;
+        case 1:
+            gpio_set_level((gpio_num_t)csPin1, 0);
+            break;
 
-    uint16_t code = voltageToCode(voltage);
-    writeAndUpdateDAC(code);
-    return true;
-}
+        case 2:
+            gpio_set_level((gpio_num_t)csPin2, 0);
+            break;
 
-void AD5761::writeInputRegister(uint16_t code) {
-    writeRegister(AD5761_CMD_WRITE_INPUT_REGISTER_ONLY, code);
-}
+        case 3:
+            gpio_set_level((gpio_num_t)csPin3, 0);
+            break;
 
-void AD5761::writeAndUpdateDAC(uint16_t code) {
-    writeRegister(AD5761_CMD_WRITE_AND_UPDATE_DAC, code);
-}
-
-void AD5761::updateDAC() {
-    if (_ldacPin < 0) return;
-    /* LDAC 下降沿触发:输入寄存器 → DAC 寄存器 */
-    digitalWrite(_ldacPin, HIGH);
-    delayMicroseconds(1);
-    digitalWrite(_ldacPin, LOW);
-}
-
-void AD5761::setPowerDownMode(AD5761_PowerDownMode mode) {
-    uint32_t ctrl = AD5761_CTRL_PD((uint32_t)mode);
-    writeControlRegister(ctrl);
-}
-
-void AD5761::enableBrownoutReset(bool enable) {
-    uint32_t ctrl = enable ? AD5761_CTRL_ERB : 0;
-    writeControlRegister(ctrl);
-}
-
-void AD5761::enableThermalShutdown(bool enable) {
-    uint32_t ctrl = enable ? AD5761_CTRL_ETS : 0;
-    writeControlRegister(ctrl);
-}
-
-void AD5761::getRangeLimits(float &vMin, float &vMax) const {
-    switch (_range) {
-        case RANGE_BIPOLAR_10V:   vMin = -10.0f;  vMax =  10.0f;  break;
-        case RANGE_UNIPOLAR_10V:  vMin =   0.0f;  vMax =  10.0f;  break;
-        case RANGE_BIPOLAR_5V:    vMin =  -5.0f;  vMax =   5.0f;  break;
-        case RANGE_UNIPOLAR_5V:   vMin =   0.0f;  vMax =   5.0f;  break;
-        case RANGE_BIPOLAR_2_5V:  vMin =  -2.5f;  vMax =  2.5f;  break;
-        default:                  vMin = -10.0f;  vMax =  10.0f;  break;
+        case 4:
+            gpio_set_level((gpio_num_t)csPin0, 0);
+            gpio_set_level((gpio_num_t)csPin1, 0);
+            gpio_set_level((gpio_num_t)csPin2, 0);
+            gpio_set_level((gpio_num_t)csPin3, 0);
+            break;
     }
 }
 
-uint16_t AD5761::voltageToCode(float voltage) const {
-    float vMin, vMax;
-    getRangeLimits(vMin, vMax);
-    float span = vMax - vMin;
+/* 初始化模块 */
+void ad5761_init() {
+    ad5761_SPI_init();
+    gpio_set_direction((gpio_num_t)csPin0, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)csPin1, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)csPin2, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)csPin3, GPIO_MODE_OUTPUT);
 
-    /* code = (Vout - Vmin) / span * 65535 */
-    float normalized = (voltage - vMin) / span;   /* 0.0 ~ 1.0 */
-    if (normalized < 0.0f) normalized = 0.0f;
-    if (normalized > 1.0f) normalized = 1.0f;
+    ad5761_write(CMD_SW_FULL_RESET, 0, 0);
+    ad5761_write(CMD_WR_CTRL_REG, CONTROL_REG_VAL, 0);
+    ad5761_write(CMD_SW_FULL_RESET, 0, 1);
+    ad5761_write(CMD_WR_CTRL_REG, CONTROL_REG_VAL, 1);
+    ad5761_write(CMD_SW_FULL_RESET, 0, 2);
+    ad5761_write(CMD_WR_CTRL_REG, CONTROL_REG_VAL, 2);
+    ad5761_write(CMD_SW_FULL_RESET, 0, 3);
+    ad5761_write(CMD_WR_CTRL_REG, CONTROL_REG_VAL, 3);
 
-    /* 加 0.5 做四舍五入,提升精度 */
-    uint32_t code = (uint32_t)(normalized * 65535.0f + 0.5f);
-    if (code > 65535) code = 65535;
-    return (uint16_t)code;
+    ad5761_write(CMD_WR_UPDATE_DAC_REG, 32768, 0);
+    ad5761_write(CMD_WR_UPDATE_DAC_REG, 32768, 1);
+    ad5761_write(CMD_WR_UPDATE_DAC_REG, 32768, 2);
+    ad5761_write(CMD_WR_UPDATE_DAC_REG, 32768, 3);
+
+    /* 全部待机 */
+    ad5761_pull_up_ss(4);
 }
 
-float AD5761::codeToVoltage(uint16_t code) const {
-    float vMin, vMax;
-    getRangeLimits(vMin, vMax);
-    float span = vMax - vMin;
+/* SPI 外设初始化 */
+void ad5761_SPI_init() {
+    /* 创建参数结构 (字段顺序须与 spi_bus_config_t 声明顺序一致) */
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = AD5761_MOSI_PIN,
+        .miso_io_num = -1,
+        .sclk_io_num = AD5761_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
+    };
 
-    float normalized = (float)code / 65535.0f;
-    return vMin + normalized * span;
+    /* 初始化 SPI3 */
+    spi_bus_initialize(AD5761_USED_SPI, &buscfg, SPI_DMA_CH_AUTO);
+
+    /* 设备接口配置 (字段顺序须与 spi_device_interface_config_t 声明顺序一致) */
+    spi_device_interface_config_t devcfg0 = {
+        .mode = 2,                      /* SPI mode 2 */
+        .clock_speed_hz = AD5761_CLOCK_RATE,
+        .spics_io_num = -1,             /* 软件控制片选 */
+        .flags = SPI_DEVICE_HALFDUPLEX,
+        .queue_size = 1,
+        .pre_cb = NULL,
+        .post_cb = NULL,
+    };
+
+    /* 添加 SPI 设备, 返回句柄 */
+    spi_bus_add_device(AD5761_USED_SPI, &devcfg0, &vspi_handle);
 }
 
-void AD5761::writeRegister(uint8_t cmd, uint16_t data) {
-    /* AD5761 命令帧: [C3 C2 C1 C0] [D15 ... D0] 共 24 bit
-     * 采用 MSB 优先,先发命令字节,再发两个数据字节 */
-    uint8_t cmdByte = (uint8_t)(cmd & 0x0F);
-    uint8_t dataHi  = (uint8_t)((data >> 8) & 0xFF);
-    uint8_t dataLo  = (uint8_t)(data & 0xFF);
+void ad5761_write(uint8_t reg_addr_cmd, uint16_t reg_data, char cs) {
+    /* 拉低选中片选 */
+    ad5761_pull_down_ss(cs);
 
-    _spi.beginTransaction(_spiSettings);
-    digitalWrite(_csPin, LOW);
+    /* 准备 SPI 数据 */
+    uint8_t tx_data[3];
 
-    _spi.transfer(cmdByte);
-    _spi.transfer(dataHi);
-    _spi.transfer(dataLo);
+    tx_data[0] = reg_addr_cmd;
+    tx_data[1] = (reg_data & 0xFF00) >> 8;
+    tx_data[2] = (reg_data & 0x00FF) >> 0;
 
-    digitalWrite(_csPin, HIGH);
-    _spi.endTransaction();
-}
+    /* 事务结构 (字段顺序须与 spi_transaction_t 声明顺序一致) */
+    spi_transaction_t t = {
+        .length = 3 * 8,
+        .tx_buffer = tx_data,
+    };
 
-void AD5761::writeControlRegister(uint32_t value) {
-    /* 控制寄存器写: 命令 = 0x2, 数据 = 16-bit 控制字 */
-    writeRegister(AD5761_CMD_WRITE_CONTROL_REGISTER, (uint16_t)(value & 0xFFFF));
-}
+    /* 传输 SPI 数据 */
+    spi_device_polling_transmit(vspi_handle, &t);
 
-/* ================================================================== *
- *  多芯片管理 AD5761Array 实现
- * ================================================================== */
-AD5761Array::AD5761Array(const uint8_t *syncPins, uint8_t count,
-                         SPIClass &spi,
-                         uint32_t spiFreq,
-                         int8_t ldacPin,
-                         int8_t clrPin,
-                         int8_t resetPin)
-    : _dacs(nullptr),
-      _count(count),
-      _ldacPin(ldacPin),
-      _clrPin(clrPin),
-      _resetPin(resetPin) {
-    if (count == 0 || syncPins == nullptr) return;
-
-    /* 动态创建 count 个 AD5761 对象,共用 SPI,各自独立片选 */
-    _dacs = new AD5761 *[count];
-    for (uint8_t i = 0; i < count; i++) {
-        /* 各芯片不单独持有 LDAC/CLR/RESET,由 Array 统一控制 */
-        _dacs[i] = new AD5761(syncPins[i], spi, spiFreq,
-                              /*ldac=*/-1, /*clr=*/-1, /*reset=*/-1);
-    }
-}
-
-AD5761Array::~AD5761Array() {
-    if (_dacs == nullptr) return;
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) {
-            delete _dacs[i];
-            _dacs[i] = nullptr;
-        }
-    }
-    delete[] _dacs;
-    _dacs = nullptr;
-}
-
-bool AD5761Array::begin() {
-    /* 配置共用 LDAC 引脚(默认透明模式,等待 latchAll() 触发同步) */
-    if (_ldacPin >= 0) {
-        pinMode(_ldacPin, OUTPUT);
-        /* 默认拉高 = 保持输入寄存器内容,不立即更新输出。
-         * 这样 prepareVoltage*() 写入后需 latchAll() 才会更新。 */
-        digitalWrite(_ldacPin, HIGH);
-    }
-
-    /* 配置共用 CLR / RESET 引脚 */
-    if (_clrPin >= 0) {
-        pinMode(_clrPin, OUTPUT);
-        digitalWrite(_clrPin, HIGH);
-    }
-    if (_resetPin >= 0) {
-        pinMode(_resetPin, OUTPUT);
-        digitalWrite(_resetPin, HIGH);
-    }
-
-    /* 逐个初始化:仅第一个初始化 SPI 总线 */
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] == nullptr) continue;
-        _dacs[i]->begin(/*initSpiBus=*/(i == 0));
-    }
-    return true;
-}
-
-void AD5761Array::hardwareResetAll() {
-    if (_resetPin < 0) return;
-    digitalWrite(_resetPin, LOW);
-    delayMicroseconds(100);
-    digitalWrite(_resetPin, HIGH);
-    delay(5);
-}
-
-void AD5761Array::softwareResetAll() {
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) _dacs[i]->softwareReset();
-    }
-}
-
-void AD5761Array::setOutputRangeAll(AD5761_OutputRange range, bool useInternalRef) {
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) _dacs[i]->setOutputRange(range, useInternalRef);
-    }
-}
-
-bool AD5761Array::setOutputRange(uint8_t index, AD5761_OutputRange range, bool useInternalRef) {
-    if (index >= _count || _dacs[index] == nullptr) return false;
-    _dacs[index]->setOutputRange(range, useInternalRef);
-    return true;
-}
-
-void AD5761Array::setVoltageAll(float voltage) {
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) _dacs[i]->setVoltage(voltage);
-    }
-}
-
-void AD5761Array::prepareVoltageAll(float voltage) {
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) {
-            uint16_t code = _dacs[i]->voltageToCode(voltage);
-            _dacs[i]->writeInputRegister(code);
-        }
-    }
-}
-
-bool AD5761Array::setVoltage(uint8_t index, float voltage) {
-    if (index >= _count || _dacs[index] == nullptr) return false;
-    _dacs[index]->setVoltage(voltage);
-    return true;
-}
-
-bool AD5761Array::prepareVoltage(uint8_t index, float voltage) {
-    if (index >= _count || _dacs[index] == nullptr) return false;
-    uint16_t code = _dacs[index]->voltageToCode(voltage);
-    _dacs[index]->writeInputRegister(code);
-    return true;
-}
-
-void AD5761Array::setVoltages(const float *voltages) {
-    if (voltages == nullptr) return;
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) _dacs[i]->setVoltage(voltages[i]);
-    }
-}
-
-void AD5761Array::prepareVoltages(const float *voltages) {
-    if (voltages == nullptr) return;
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) {
-            uint16_t code = _dacs[i]->voltageToCode(voltages[i]);
-            _dacs[i]->writeInputRegister(code);
-        }
-    }
-}
-
-void AD5761Array::setPowerDownModeAll(AD5761_PowerDownMode mode) {
-    for (uint8_t i = 0; i < _count; i++) {
-        if (_dacs[i] != nullptr) _dacs[i]->setPowerDownMode(mode);
-    }
-}
-
-AD5761 *AD5761Array::getDAC(uint8_t index) {
-    if (index >= _count) return nullptr;
-    return _dacs[index];
-}
-
-void AD5761Array::pulseLDAC() {
-    if (_ldacPin < 0) return;
-    digitalWrite(_ldacPin, HIGH);
-    delayMicroseconds(1);
-    digitalWrite(_ldacPin, LOW);
-}
-
-void AD5761Array::latchAll() {
-    /* 触发共用 LDAC 下降沿,所有芯片同步将输入寄存器内容更新到 DAC 输出 */
-    pulseLDAC();
+    /* 拉高选中片选 */
+    ad5761_pull_up_ss(cs);
 }

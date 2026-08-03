@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "scan": {
+    "cx_V": 0.0,
+    "cy_V": 0.0,
+    "range_x_V": 1.0,
+    "range_y_V": 1.0,
+    "nx": 256,
+    "ny": 256,
+    "speed_pps": 1000,
+    "direction_idx": 2
+  },
+  "advanced": {
+    "settle_ms": 10,
+    "overshoot_V": 0.1,
+    "feedback_bw_hz": 1000,
+    "average": 1,
+    "bidir_calib": false,
+    "preflight": true
+  }
+}
