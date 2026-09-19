@@ -15,7 +15,7 @@
 #define VERSION_H
 
 /* 当前固件版本 (GET_FW_VERSION 返回此 ASCII 字符串) */
-#define FW_VERSION_STRING  "STM_V1.3.0"
+#define FW_VERSION_STRING  "STM_V1.4.0"
 
 /* 协议版本 */
 #define PROTO_VERSION_MAJOR  1

@@ -51,7 +51,7 @@ struct ApproachParams {
     float    thresh_lock_nA = 0.9f;
     float    z_start_V      = 0.0f;
     float    z_speed_Vps    = 1.0f;
-    uint16_t max_steps      = 10000;
+    uint32_t max_steps      = 10000;   /* v1.4: 由 u16 扩展为 u32 */
     uint8_t  retry          = 1;
     uint16_t microstep      = 16;
 };

@@ -199,7 +199,7 @@ enum ApproachPhase : uint8_t {
 #define LEN_P_STEP_MOTOR     7
 #define LEN_P_SET_SCAN_MODE  1
 #define LEN_P_SCAN_START     31
-#define LEN_P_APPROACH_START 27
+#define LEN_P_APPROACH_START 29     /* v1.4: max_steps 由 u16 改为 u32 (27→29 字节) */
 #define LEN_P_SET_CALIB      16
 
 #define LEN_P_STATUS         22
