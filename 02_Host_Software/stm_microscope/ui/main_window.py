@@ -441,6 +441,12 @@ class MainWindow(QMainWindow):
         params = self.settings_fields.build_approach_params()
         def work():
             try:
+                if params.max_steps > 65535:
+                    self.bridge.log.emit(
+                        f"[Approach] 注意: max_steps={params.max_steps} > 65535，"
+                        f"将以 u32 新协议发送。旧固件会将其截断为 {params.max_steps & 0xFFFF}，"
+                        "如步数提前停止请将最大步数降至 ≤65535 或更新固件"
+                    )
                 self.controller.set_mode(Mode.APPROACH)
                 self.controller.start_approach(params)
                 self.bridge.log.emit("[Approach] 已启动")

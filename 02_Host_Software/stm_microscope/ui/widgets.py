@@ -283,9 +283,9 @@ class CalibrationFields(QWidget):
         form = QFormLayout(self)
         form.setContentsMargins(0, 0, 0, 0)
         self.tia_R = dspin(100e6, 1e3, 1e10, step=10e6, decimals=0, suffix=" Ω")
-        self.x_nmV = dspin(0.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
-        self.y_nmV = dspin(0.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
-        self.z_nmV = dspin(0.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
+        self.x_nmV = dspin(10.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
+        self.y_nmV = dspin(10.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
+        self.z_nmV = dspin(10.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
         self.apply_btn = QPushButton("应用 (RAM)")
         self.save_btn = QPushButton("存 NVS")
         self.load_btn = QPushButton("加载")
@@ -389,7 +389,12 @@ class ApproachFields(QWidget):
         self.thresh_lock = dspin(0.9, 0.0, 100.0, step=0.01, decimals=3, suffix=" nA")
         self.z_start = dspin(0.0, -15.0, 15.0, step=0.1, decimals=3, suffix=" V")
         self.z_speed = dspin(1.0, 0.01, 100.0, step=0.1, decimals=3, suffix=" V/s")
-        self.max_steps = ispin(10000, 1, 65535, step=100)
+        self.max_steps = ispin(10000, 1, 1000000, step=1000)
+        self.max_steps.setToolTip(
+            "最大累计步进脉冲数（安全上限）。\n"
+            "≤ 65535: 旧 u16 协议格式，兼容所有固件；\n"
+            "> 65535: 新 u32 格式，需固件同步更新，否则会被旧固件截断为低16位。"
+        )
         self.retry = ispin(5, 0, 255)
         self.microstep = QComboBox()
         for ms in (1, 2, 4, 8, 16, 32, 64, 128, 256):
@@ -449,9 +454,9 @@ class SettingsFields(QWidget):
         calib_form.setContentsMargins(4, 4, 4, 4)
         calib_form.setSpacing(4)
         self.tia_R = dspin(100e6, 1e3, 1e10, step=10e6, decimals=0, suffix=" Ω")
-        self.x_nmV = dspin(0.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
-        self.y_nmV = dspin(0.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
-        self.z_nmV = dspin(0.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
+        self.x_nmV = dspin(10.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
+        self.y_nmV = dspin(10.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
+        self.z_nmV = dspin(10.0, 0.0, 1000.0, step=1.0, decimals=2, suffix=" nm/V")
         self.calib_apply_btn = QPushButton("应用 (RAM)")
         self.calib_save_btn = QPushButton("存 NVS")
         self.calib_load_btn = QPushButton("加载")
@@ -476,7 +481,12 @@ class SettingsFields(QWidget):
         self.thresh_lock = dspin(0.9, 0.0, 100.0, step=0.01, decimals=3, suffix=" nA")
         self.z_start = dspin(0.0, -15.0, 15.0, step=0.1, decimals=3, suffix=" V")
         self.z_speed = dspin(1.0, 0.01, 100.0, step=0.1, decimals=3, suffix=" V/s")
-        self.max_steps = ispin(10000, 1, 65535, step=100)
+        self.max_steps = ispin(10000, 1, 1000000, step=1000)
+        self.max_steps.setToolTip(
+            "最大累计步进脉冲数（安全上限）。\n"
+            "≤ 65535: 旧 u16 协议格式，兼容所有固件；\n"
+            "> 65535: 新 u32 格式，需固件同步更新，否则会被旧固件截断为低16位。"
+        )
         self.retry = ispin(5, 0, 255)
         self.microstep = QComboBox()
         for ms in (1, 2, 4, 8, 16, 32, 64, 128, 256):
@@ -1333,9 +1343,10 @@ class LogPanel(QWidget):
         self._line_count += 1
         # 超限时移除旧行（QTextEdit 没有 trim API，用 cursor 删除）
         if self._line_count > self.MAX_LINES:
+            from PySide6.QtGui import QTextCursor
             cursor = self.text.textCursor()
-            cursor.movePosition(cursor.Start)
-            cursor.movePosition(cursor.Down, cursor.KeepAnchor,
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor,
                                 self._line_count - self.MAX_LINES)
             cursor.removeSelectedText()
             cursor.deleteChar()

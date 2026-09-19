@@ -90,7 +90,7 @@ READ_BODY:
 | 0x31 | SCAN_STOP        | 0            | 停止扫描 |
 | 0x32 | SCAN_PAUSE       | 0            | 暂停扫描 (可恢复) |
 | 0x33 | SCAN_RESUME      | 0            | 恢复扫描 |
-| 0x40 | APPROACH_START   | 27           | 两段式 approach |
+| 0x40 | APPROACH_START   | 27 或 29     | 两段式 approach (长度自适应, 见 4.15) |
 | 0x41 | APPROACH_STOP    | 0            | 停止 approach |
 | 0x50 | SET_CALIB        | 16           | 标定参数 (写 RAM) |
 | 0x51 | SAVE_CALIB       | 0            | 标定持久化到 NVS |
@@ -311,10 +311,15 @@ READ_BODY:
 10    4     thresh_lock_nA    f32  锁定电流阈值 (nA)，达此值完成 approach
 14    4     z_start_V         f32  DAC 细逼近起点电压 (V)
 18    4     z_speed_Vps       f32  DAC 细逼近速度 (V/s)
-22    2     max_steps         u16  最大步进步数 (安全上限)
-24    1     retry             u8   细逼近失败后步进再走的脉冲数
-25    2     microstep         u16  TMC2209 微步配置 (1/2/4/8/16/32/64/128/256)
+22    2/4  max_steps         u16/u32  最大步进步数 (安全上限)
+24/26 1     retry             u8   细逼近失败后步进再走的脉冲数
+25/27 2     microstep         u16  TMC2209 微步配置 (1/2/4/8/16/32/64/128/256)
 ```
+
+**max_steps 长度自适应编码 (v1.1)**：
+- `max_steps ≤ 65535`：用 **u16** 编码，总长 **27** 字节 —— 与 v1.0 固件完全兼容
+- `max_steps > 65535`：用 **u32** 编码，总长 **29** 字节 —— 需固件 v1.1+ 同步支持，
+  旧固件会截断读取低 16 位（例如 1000000 → 16960，表现为 approach 提前停止）
 
 **两段式状态机**：
 ```

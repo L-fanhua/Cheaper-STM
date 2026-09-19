@@ -812,12 +812,17 @@ def approach_start(
         raise ValueError(f"z_start {z_start_V} out of [-15, 15]")
     if not 0 < z_speed_Vps <= 100:
         raise ValueError(f"z_speed {z_speed_Vps} out of (0, 100]")
-    if not 1 <= max_steps <= 65535:
-        raise ValueError(f"max_steps {max_steps} out of [1, 65535]")
+    if not 1 <= max_steps <= 1000000:
+        raise ValueError(f"max_steps {max_steps} out of [1, 1000000]")
     if microstep not in (1, 2, 4, 8, 16, 32, 64, 128, 256):
         raise ValueError(f"microstep {microstep} invalid")
+    # 长度自适应编码 (v1.1)：
+    # - max_steps <= 65535 → 旧 u16 格式 (27 字节)，兼容 v1.0 固件
+    # - max_steps >  65535 → 新 u32 格式 (29 字节)，需固件同步支持，
+    #   否则旧固件会将其截断为低 16 位 (如 1000000 → 16960)
+    fmt = "<H I ffff I B H" if max_steps > 65535 else "<H I ffff H B H"
     payload = struct.pack(
-        "<H I ffff H B H",
+        fmt,
         step_pulse,
         step_speed_sps,
         thresh_pre_nA,

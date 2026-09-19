@@ -274,8 +274,19 @@ class STMController:
         persist: bool = True,
     ) -> None:
         """设置标定参数。persist=True 同时保存到 NVS。"""
-        if tia_R <= 0 or x_nmV <= 0 or y_nmV <= 0 or z_nmV <= 0:
-            raise ValueError("calibration values must be positive")
+        invalid = []
+        if tia_R <= 0:
+            invalid.append("TIA R (Ω)")
+        if x_nmV <= 0:
+            invalid.append("x 灵敏度 (nm/V)")
+        if y_nmV <= 0:
+            invalid.append("y 灵敏度 (nm/V)")
+        if z_nmV <= 0:
+            invalid.append("z 灵敏度 (nm/V)")
+        if invalid:
+            raise ValueError(
+                f"标定参数必须大于 0，以下字段无效: {', '.join(invalid)}"
+            )
         self.transport.send(Cmd.SET_CALIB, set_calib(tia_R, x_nmV, y_nmV, z_nmV).payload)
         self._calib = Calibration(tia_R, x_nmV, y_nmV, z_nmV)
         self._calib_loaded = True
@@ -416,6 +427,12 @@ class STMController:
             retry=params.retry,
             microstep=params.microstep,
         )
+        if params.max_steps > 65535:
+            logger.warning(
+                "max_steps=%d > 65535, using u32 protocol format; legacy u16 "
+                "firmware would truncate it to %d",
+                params.max_steps, params.max_steps & 0xFFFF,
+            )
         self.transport.send(Cmd.APPROACH_START, frame.payload)
 
     def stop_approach(self) -> None:
