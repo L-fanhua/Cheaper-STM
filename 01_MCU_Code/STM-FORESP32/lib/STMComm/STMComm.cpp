@@ -503,7 +503,12 @@ uint8_t STMComm::handleSetCalib(const uint8_t *p, uint16_t n) {
 }
 
 uint8_t STMComm::handleApproachStart(const uint8_t *p, uint16_t n) {
-    if (n != LEN_P_APPROACH_START) return NACK_PARAM_OUT_OF_RANGE;
+    /* v1.4.1: max_steps 长度自适应 (PROTOCOL.md 4.15, 与上位机 protocol.py 一致):
+     *   29 字节 (v1.4): max_steps 为 u32
+     *   27 字节 (v1.0): max_steps 为 u16, 向后兼容旧上位机 */
+    if (n != LEN_P_APPROACH_START && n != LEN_P_APPROACH_START_V1) {
+        return NACK_PARAM_OUT_OF_RANGE;
+    }
     if (_sys.mode != MODE_APPROACH) return NACK_NOT_IN_IDLE_MODE; /* 需先 SET_MODE(3) */
     if (_sys.locked) return NACK_HARDWARE_FAULT;
 
@@ -515,7 +520,11 @@ uint8_t STMComm::handleApproachStart(const uint8_t *p, uint16_t n) {
     a.thresh_lock_nA = rd_f32(&p[i]); i += 4;
     a.z_start_V      = rd_f32(&p[i]); i += 4;
     a.z_speed_Vps    = rd_f32(&p[i]); i += 4;
-    a.max_steps      = rd_u16(&p[i]); i += 2;
+    if (n == LEN_P_APPROACH_START) {
+        a.max_steps  = rd_u32(&p[i]); i += 4;   /* 29B 布局: u32 */
+    } else {
+        a.max_steps  = rd_u16(&p[i]); i += 2;   /* 27B 布局: u16 (v1.0) */
+    }
     a.retry          = p[i];          i += 1;
     a.microstep      = rd_u16(&p[i]); i += 2;
 

@@ -48,6 +48,14 @@ ADS8685  g_adc(ADS8685_CS_PIN, adsSPI, ADS8685_SPI_FREQ, ADS8685_RST_PIN);
 #define DIR_PIN     13
 #define EN_PIN      15      /* 低电平有效 */
 
+/* ---- 步进电机方向反转开关 (编译期开关, 修改后需重新编译烧录) ----
+ * 电机实际转向与协议语义相反时 (FORWARD 应向样品靠近) 修改此值:
+ *   0 = 不反转: FORWARD(0)→DIR_HIGH, BACKWARD(1)→DIR_LOW
+ *   1 = 反转:   FORWARD(0)→DIR_LOW,  BACKWARD(1)→DIR_HIGH
+ * 历史: v1.2.1 因步进电机线序调整软件取反过一次;
+ *       v1.4.2 整理为此开关, 当前电机实测方向相反, 取 1 */
+#define STEPPER_INVERT_DIR  1
+
 #define STEPPER_MIN_PULSE_US    10      /* STEP 高/低电平脉宽 (us), TMC2209 需>100ns */
 #define STEPPER_EN_SETUP_US     10      /* EN 使能后等待稳定 (us) */
 #define STEPPER_DIR_SETUP_US    5       /* DIR 建立时间 (us), STEP 之前 */
@@ -141,8 +149,14 @@ public:
 
         /* v1.1.7: DIR 在循环外统一设置一次, 避免每个脉冲重复设置导致
          *         不同方向下的时序差异 (转速不一致 bug 修复)
-         * v1.2.1: DIR 取反 — 因步进电机线序调整, 需软件翻转方向 */
-        digitalWrite(DIR_PIN, dir ? LOW : HIGH);
+         * v1.2.1: DIR 取反 — 因步进电机线序调整, 需软件翻转方向
+         * v1.4.2: 整理为 STEPPER_INVERT_DIR 编译期开关 (见文件头引脚定义区),
+         *         方向不对时改宏重烧即可, 不必改代码逻辑 */
+#if STEPPER_INVERT_DIR
+        digitalWrite(DIR_PIN, dir ? HIGH : LOW);   /* 反转: FORWARD(0)→LOW */
+#else
+        digitalWrite(DIR_PIN, dir ? LOW : HIGH);   /* 正常: FORWARD(0)→HIGH */
+#endif
         delayMicroseconds(STEPPER_DIR_SETUP_US);
 
         /* 步间间隔 (us) = 1e6 / sps; 钳位下限防止过快 */
