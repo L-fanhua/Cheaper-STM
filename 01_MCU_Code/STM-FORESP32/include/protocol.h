@@ -25,8 +25,8 @@
 #define FRAME_TAIL       0x0A
 
 #define LENGTH_MIN       3     /* CMD(1) + CRC(2), 无 payload */
-#define LENGTH_MAX       1027  /* CMD(1) + payload(1024) + CRC(2) */
-#define PAYLOAD_MAX      1024
+#define LENGTH_MAX       8203  /* v1.1: payload 8200B, 为 SCAN_ROW 整行传输扩容 (原 1027) */
+#define PAYLOAD_MAX      8200  /* v1.1: 原 1024; 4+8*1024=8196 可容纳 nx=1024 整行 */
 
 /* ================================================================== *
  *  工作模式
@@ -112,6 +112,15 @@ enum StepDir : uint8_t {
 enum ApproachPhase : uint8_t {
     APPROACH_COARSE = 0,
     APPROACH_FINE   = 1,
+};
+
+/* ================================================================== *
+ *  扫描行阶段 (v1.5)
+ * ================================================================== */
+enum ScanRowPhase : uint8_t {
+    SCAN_ROW_IDLE    = 0,   /* 未在扫描 */
+    SCAN_ROW_SETTLE  = 1,   /* 行前预压 + settling */
+    SCAN_ROW_SCAN    = 2,   /* 行内逐点采集 */
 };
 
 /* ================================================================== *

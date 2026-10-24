@@ -441,6 +441,11 @@ class SettingsFields(QWidget):
     apply_requested = Signal(Calibration)
     save_requested = Signal()
     load_requested = Signal()
+    # 参数文件 (跨面板持久化, 由 MainWindow 编排: 设置栏 + 手动控制)
+    settings_store = Signal()      # 存储 -> settings.json
+    settings_load = Signal()       # 从 settings.json 恢复
+    settings_saveas = Signal()     # 另存为… (多套方案)
+    settings_open = Signal()       # 打开… (多套方案)
 
     def __init__(self):
         super().__init__()
@@ -521,6 +526,36 @@ class SettingsFields(QWidget):
         layout.addWidget(calib_group)
         layout.addWidget(approach_group)
         layout.addWidget(fb_adv_group)
+
+        # 参数文件 (设置栏 + 手动控制 的跨面板持久化)
+        file_group = QGroupBox("参数文件")
+        file_lay = QVBoxLayout(file_group)
+        file_lay.setContentsMargins(4, 4, 4, 4)
+        file_lay.setSpacing(4)
+        self.settings_store_btn = QPushButton("存储")
+        self.settings_load_btn = QPushButton("读取")
+        self.settings_saveas_btn = QPushButton("另存为…")
+        self.settings_open_btn = QPushButton("打开…")
+        self.settings_store_btn.setToolTip(
+            "把当前所有参数（本面板三组 + 手动控制）写入 settings.json，\n程序下次启动时自动恢复。"
+        )
+        self.settings_load_btn.setToolTip(
+            "从 settings.json 恢复所有参数到界面。\n只填界面值、不下发硬件，需再手动点各组「应用」。"
+        )
+        file_row1 = QHBoxLayout()
+        file_row1.addWidget(self.settings_store_btn)
+        file_row1.addWidget(self.settings_load_btn)
+        file_row2 = QHBoxLayout()
+        file_row2.addWidget(self.settings_saveas_btn)
+        file_row2.addWidget(self.settings_open_btn)
+        file_lay.addLayout(file_row1)
+        file_lay.addLayout(file_row2)
+        # 信号连接不依赖 bind(), 构造即连 (纯 UI 事件, 不需要 controller)
+        self.settings_store_btn.clicked.connect(self.settings_store.emit)
+        self.settings_load_btn.clicked.connect(self.settings_load.emit)
+        self.settings_saveas_btn.clicked.connect(self.settings_saveas.emit)
+        self.settings_open_btn.clicked.connect(self.settings_open.emit)
+        layout.addWidget(file_group)
         layout.addStretch()
 
     def _on_calib_apply(self) -> None:
@@ -547,6 +582,66 @@ class SettingsFields(QWidget):
     def build_approach_params(self) -> ApproachParams:
         """包装内部 build_params，返回 ApproachParams"""
         return self.build_params()
+
+    # ---- 参数持久化 (由 MainWindow 编排跨面板存取) ----
+
+    def config_dict(self) -> dict:
+        """收集本面板全部参数 (标定 + Approach + 反馈高级)"""
+        return {
+            "calibration": {
+                "tia_R": self.tia_R.value(),
+                "x_nmV": self.x_nmV.value(),
+                "y_nmV": self.y_nmV.value(),
+                "z_nmV": self.z_nmV.value(),
+            },
+            "approach": {
+                "step_pulse": self.step_pulse.value(),
+                "step_speed_sps": self.step_speed.value(),
+                "thresh_pre_nA": self.thresh_pre.value(),
+                "thresh_lock_nA": self.thresh_lock.value(),
+                "z_start_V": self.z_start.value(),
+                "z_speed_Vps": self.z_speed.value(),
+                "max_steps": self.max_steps.value(),
+                "retry": self.retry.value(),
+                "microstep": self.microstep.currentData(),
+            },
+            "feedback_adv": {
+                "pid_freq": self.pid_freq.value(),
+                "z_min": self.z_min.value(),
+                "z_max": self.z_max.value(),
+                "overcurrent": self.overcurrent.value(),
+            },
+        }
+
+    def load_config_dict(self, data: dict) -> None:
+        """从 dict 恢复界面参数 (仅界面值, 不下发硬件)"""
+        def setd(spin, v):
+            try:
+                spin.setValue(float(v) if isinstance(spin, QDoubleSpinBox) else int(v))
+            except (TypeError, ValueError):
+                pass
+        cal = data.get("calibration", {})
+        for k, w in (("tia_R", self.tia_R), ("x_nmV", self.x_nmV),
+                     ("y_nmV", self.y_nmV), ("z_nmV", self.z_nmV)):
+            if k in cal:
+                setd(w, cal[k])
+        ap = data.get("approach", {})
+        for k, w in (("step_pulse", self.step_pulse), ("step_speed_sps", self.step_speed),
+                     ("thresh_pre_nA", self.thresh_pre), ("thresh_lock_nA", self.thresh_lock),
+                     ("z_start_V", self.z_start), ("z_speed_Vps", self.z_speed),
+                     ("max_steps", self.max_steps), ("retry", self.retry)):
+            if k in ap:
+                setd(w, ap[k])
+        ms = ap.get("microstep")
+        if ms is not None:
+            idx = self.microstep.findData(int(ms))
+            if idx >= 0:
+                self.microstep.setCurrentIndex(idx)
+        fb = data.get("feedback_adv", {})
+        for k, w in (("pid_freq", self.pid_freq), ("z_min", self.z_min),
+                     ("z_max", self.z_max), ("overcurrent", self.overcurrent)):
+            if k in fb:
+                setd(w, fb[k])
 
     def bind(self, ctrl: STMController) -> None:
         # 标定
@@ -855,6 +950,8 @@ class ScanFields(QWidget):
                 settle_ms=self.settle.value(),
                 overshoot_V=self.overshoot.value(),
             )
+            # 通知 MainWindow 初始化数据引擎/示波器 (在发命令前)
+            self.start_requested.emit(params)
             _safe(lambda: ctrl.start_scan(params), self)
         self.start_btn.clicked.connect(start)
         self.stop_btn.clicked.connect(lambda: _safe(ctrl.stop_scan, self))
@@ -943,16 +1040,23 @@ class ManualControlBar(QWidget):
         self.fwd_btn = QPushButton("进")
         self.bwd_btn = QPushButton("退")
         self.full_retract_btn = QPushButton("全退")
+        self.goto_target_spin = ispin(0, -2000000, 2000000, step=100)
+        self.goto_target_spin.setToolTip(
+            "归位目标:绝对步数。\n坐标系 = 固件 STATUS 上报的带符号位置\n(上电位置=0,进为正、退为负)。\n点击「归位」后电机会自动前进/后退走到该步数。"
+        )
+        self.goto_btn = QPushButton("归位")
         f2 = QFormLayout()
         f2.setContentsMargins(0, 0, 0, 0)
         f2.setSpacing(2)
         f2.addRow("步数:", self.step_spin)
         f2.addRow("速度:", self.speed_spin)
+        f2.addRow("目标步:", self.goto_target_spin)
         r2 = QHBoxLayout()
         r2.addWidget(self.fwd_btn)
         r2.addWidget(self.bwd_btn)
         r2.addWidget(self.full_retract_btn)
         f2.addRow(r2)
+        f2.addRow(self.goto_btn)
         z2.layout().addLayout(f2)
 
         # 区3 - 样品偏压
@@ -1011,6 +1115,40 @@ class ManualControlBar(QWidget):
         arrow = "▼" if checked else "▶"
         self.header.setText(f"  {arrow}  手动控制")
         self.content.setVisible(checked)
+
+    def set_goto_running(self, running: bool) -> None:
+        """切换归位按钮状态: 运行中显示为「停止归位」"""
+        self.goto_btn.setText("■ 停止归位" if running else "归位")
+
+    # ---- 参数持久化 (由 MainWindow 编排跨面板存取) ----
+
+    def config_dict(self) -> dict:
+        """收集手动控制区全部参数"""
+        return {
+            "manual": {
+                "x_V": self.x_spin.value(),
+                "y_V": self.y_spin.value(),
+                "z_V": self.z_spin.value(),
+                "step_n": self.step_spin.value(),
+                "speed_sps": self.speed_spin.value(),
+                "goto_target": self.goto_target_spin.value(),
+                "bias_V": self.bias_spin.value(),
+            },
+        }
+
+    def load_config_dict(self, data: dict) -> None:
+        """从 dict 恢复界面参数 (仅界面值, 不下发硬件)"""
+        def setd(spin, v):
+            try:
+                spin.setValue(float(v) if isinstance(spin, QDoubleSpinBox) else int(v))
+            except (TypeError, ValueError):
+                pass
+        m = data.get("manual", {})
+        for k, w in (("x_V", self.x_spin), ("y_V", self.y_spin), ("z_V", self.z_spin),
+                     ("step_n", self.step_spin), ("speed_sps", self.speed_spin),
+                     ("goto_target", self.goto_target_spin), ("bias_V", self.bias_spin)):
+            if k in m:
+                setd(w, m[k])
 
     def bind(self, ctrl: STMController) -> None:
         """把所有按钮连接到 controller"""

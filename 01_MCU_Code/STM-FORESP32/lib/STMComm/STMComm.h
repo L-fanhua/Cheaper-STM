@@ -59,6 +59,10 @@ private:
     static const uint16_t SCAN_TX_SIZE = 8 + 8 * SCAN_NX_MAX + 16;
     uint8_t _txScanBuf[SCAN_TX_SIZE];
 
+    /* 扫描行数据缓冲 (v1.5): I 实测电流 / z 恒高常量 (按 x 升序) */
+    float _scanRowI[SCAN_NX_MAX];
+    float _scanRowZ[SCAN_NX_MAX];
+
     /* STATUS 上报节流 */
     uint32_t _lastStatusMs = 0;
     uint32_t _statusPeriodMs = 20;   /* 50 Hz */
@@ -76,6 +80,12 @@ private:
     /* ---- Approach 状态机驱动 (v1.3) ----
      * 在 tick() 中周期调用, 执行单步逼近逻辑并上报数据 */
     void approachTick();
+
+    /* ---- Scan 状态机驱动 (v1.5 恒高模式) ----
+     * 在 tick() 中周期调用: 每行 端点预压→settle→逐点采集→SCAN_ROW */
+    void scanTick();             /* 扫描调度 (节拍补点, settle 切换) */
+    void doScanPoint();          /* 输出并采集单个扫描点 */
+    void startRowPresettle();    /* 新行开始: 端点预压 + 进入 settle 阶段 */
 
     /* 各命令处理 (返回 NACK reason, 0=成功) */
     uint8_t handleSetMode(const uint8_t *p, uint16_t n);

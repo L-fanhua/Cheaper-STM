@@ -140,7 +140,7 @@ class FrameReader:
             elif self.state == "LEN":
                 if len(self.buf) == 4:
                     length = struct.unpack("<H", self.buf[2:4])[0]
-                    if length < 3 or length > 1027:
+                    if length < 3 or length > 8203:  # v1.1: SCAN_ROW 扩容 (原 1027)
                         self.buf.clear()
                         self.state = "HEAD0"
                         continue

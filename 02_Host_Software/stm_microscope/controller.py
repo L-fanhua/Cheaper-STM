@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -72,6 +73,10 @@ from transport import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GotoCancelled(RuntimeError):
+    """goto_step 被用户手动取消"""
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +159,7 @@ class STMController:
         self._calib_loaded = False
         self._last_status: Optional[Status] = None
         self._state_lock = threading.Lock()
+        self._scan_row_logged = False   # 首行 SCAN_ROW 诊断日志标志
 
         # 转发 transport 的异步回调给订阅者
         self._on_status: Optional[StatusCallback] = None
@@ -216,6 +222,13 @@ class STMController:
             self._on_status(s)
 
     def _handle_scan_row(self, row: ScanRow) -> None:
+        if not self._scan_row_logged:
+            self._scan_row_logged = True
+            logger.info(
+                "first SCAN_ROW received: y_idx=%d nx=%d I[0]=%.4f z[0]=%.4f",
+                row.y_idx, row.nx, row.I_data[0] if row.I_data else float('nan'),
+                row.z_data[0] if row.z_data else float('nan'),
+            )
         if self._on_scan_row: self._on_scan_row(row)
 
     def _handle_scan_end(self, end: ScanEnd) -> None:
@@ -351,7 +364,8 @@ class STMController:
         """单独设 z (idle 或 feedback 模式)"""
         self.transport.send(Cmd.SET_Z, set_z(z_V).payload)
 
-    def retract_z(self, steps: int, speed_sps: int = 0) -> None:
+    def retract_z(self, steps: int, speed_sps: int = 0,
+                  timeout: Optional[float] = None) -> None:
         """步进电机后退指定步数 + z DAC 归零
 
         Args:
@@ -363,20 +377,161 @@ class STMController:
             "RETRACT_Z: steps=%d speed=%d payload=%s (%d bytes)",
             steps, speed_sps, frame.payload.hex(), len(frame.payload)
         )
-        self.transport.send(Cmd.RETRACT_Z, frame.payload)
+        self.transport.send(Cmd.RETRACT_Z, frame.payload, timeout=timeout)
 
     def set_bias(self, bias_V: float) -> None:
         """设置样品偏压电压"""
         self.transport.send(Cmd.SET_BIAS, set_bias(bias_V).payload)
 
-    def step_motor(self, steps: int, speed_sps: int = 100) -> None:
-        """手动步进电机（steps 正=进，负=退）"""
+    def step_motor(self, steps: int, speed_sps: int = 100,
+                   timeout: Optional[float] = None) -> None:
+        """手动步进电机（仅正向；固件 u16 解析不支持负数，后退请用 retract_z）"""
         frame = step_motor(steps, speed_sps)
         logger.info(
             "STEP_MOTOR: steps=%d speed=%d payload=%s (%d bytes)",
             steps, speed_sps, frame.payload.hex(), len(frame.payload)
         )
-        self.transport.send(Cmd.STEP_MOTOR, frame.payload)
+        self.transport.send(Cmd.STEP_MOTOR, frame.payload, timeout=timeout)
+
+    # -----------------------------------------------------------------
+    # 步进电机闭环归位 (纯上位机实现, 依赖 STATUS.step_pos 位置反馈)
+    # -----------------------------------------------------------------
+
+    @property
+    def current_step(self) -> Optional[int]:
+        """当前步进电机位置 (带符号, 来自 STATUS 周期上报; 无反馈时 None)"""
+        with self._state_lock:
+            return self._last_status.step_pos if self._last_status else None
+
+    def _wait_step_near(
+        self,
+        expected: int,
+        deadline: float,
+        cancel: Optional[threading.Event] = None,
+        near: int = 2,
+        stable_needed: int = 12,
+        poll_s: float = 0.05,
+    ) -> Optional[int]:
+        """等待 STATUS 反馈的位置接近 expected, 或位置持续不变(本批已走完)。
+
+        ACK 只代表命令被接受, 电机可能仍在执行, 故需轮询位置收敛。
+        返回最后观测到的位置 (可能未达 expected, 由上层继续修正)。
+        """
+        last: Optional[int] = None
+        stable = 0
+        while time.monotonic() < deadline:
+            if cancel is not None and cancel.is_set():
+                return self.current_step
+            cur = self.current_step
+            if cur is not None:
+                if abs(cur - expected) <= near:
+                    return cur
+                if cur == last:
+                    stable += 1
+                    if stable >= stable_needed:   # ~0.6s 位置不再变化 → 本批结束
+                        return cur
+                else:
+                    stable = 0
+                last = cur
+            time.sleep(poll_s)
+        return self.current_step
+
+    def goto_step(
+        self,
+        target: int,
+        speed_sps: int = 2000,
+        *,
+        batch_steps: int = 1000,
+        tolerance: int = 3,
+        total_timeout_s: float = 180.0,
+        cancel: Optional[threading.Event] = None,
+        progress=None,
+    ) -> int:
+        """闭环归位: 步进电机移动到绝对步数 target。
+
+        位置坐标系 = 固件 STATUS.step_pos (上电为 0, 进为正 / 退为负)。
+        按批次移动 (前进 STEP_MOTOR / 后退 RETRACT_Z — 固件 STEP_MOTOR 按
+        u16 无符号解析, 不支持负数), 每批后轮询 STATUS 位置收敛并修正残差,
+        直至 |当前位置 - target| <= tolerance。
+        注意: 后退批次 (RETRACT_Z) 会同时把 z DAC 置为 z_min。
+
+        保护机制:
+        - 停滞检测: 连续 3 次修正无进展 → 异常中止 (丢步严重/方向映射异常)
+        - 总超时: total_timeout_s
+        - 取消: cancel 事件置位后在下个检查点抛 GotoCancelled
+
+        Args:
+            target: 目标绝对步数 (带符号)
+            speed_sps: 步进速度 (steps/s)
+            batch_steps: 每批最多步数 (越小取消响应越快)
+            tolerance: 判定到位的容差 (步)
+            total_timeout_s: 总超时秒数
+            cancel: 取消事件 (threading.Event)
+            progress: 可选回调 progress(cur, target), 每批发送前调用 (worker 线程)
+
+        Returns:
+            最终到达的位置 (带符号)
+
+        Raises:
+            GotoCancelled: 用户取消
+            RuntimeError: 无 STATUS 反馈 / 停滞 / 超时
+        """
+        deadline = time.monotonic() + total_timeout_s
+        last_abs_delta: Optional[int] = None
+        no_progress = 0
+
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise GotoCancelled(f"已取消 (目标 {target})")
+
+            cur = self.current_step
+            if cur is None:
+                raise RuntimeError("未收到 STATUS 反馈, 无法确定当前位置 (设备未连接?)")
+            delta = target - cur
+            if abs(delta) <= tolerance:
+                return cur
+
+            # 停滞保护: 与上一次相比没有更接近目标
+            if last_abs_delta is not None and abs(delta) >= last_abs_delta:
+                no_progress += 1
+                if no_progress >= 3:
+                    raise RuntimeError(
+                        f"归位停滞: 当前 {cur}, 目标 {target}, "
+                        f"连续 {no_progress} 次修正无进展 "
+                        "(可能丢步严重, 或位置反馈方向与命令方向不一致)"
+                    )
+            else:
+                no_progress = 0
+            last_abs_delta = abs(delta)
+
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"归位超时: 当前 {cur}, 目标 {target}")
+
+            # 本批步数: 截断到 i16 安全范围和批量上限
+            n = max(-32000, min(32000, delta))
+            if abs(n) > batch_steps:
+                n = batch_steps if n > 0 else -batch_steps
+
+            if progress is not None:
+                try:
+                    progress(cur, target)
+                except Exception:
+                    pass
+
+            logger.info("GOTO_STEP: cur=%d target=%d batch=%+d", cur, target, n)
+
+            # ACK 超时按批次时长动态放宽 (固件阻塞式发脉冲, ACK 在本批走完后才回)
+            batch_timeout = max(8.0, abs(n) / max(speed_sps, 1) * 2.0 + 3.0)
+
+            if n > 0:
+                # 前进: STEP_MOTOR (固件按 u16 解析, 只接受正数)
+                self.step_motor(n, speed_sps, timeout=batch_timeout)
+            else:
+                # 后退: RETRACT_Z (固件专用后退命令, 会同时把 z DAC → z_min)
+                self.retract_z(-n, speed_sps, timeout=batch_timeout)
+
+            # 等本批走完 (位置接近 cur+n 或稳定不变)
+            self._wait_step_near(cur + n, deadline, cancel=cancel)
 
     def set_scan_mode(self, mode: ScanMode) -> None:
         """设置扫描模式（恒流/恒高）"""
@@ -399,6 +554,15 @@ class STMController:
             direction=params.direction,
             settle_ms=params.settle_ms,
             overshoot_V=params.overshoot_V,
+        )
+        self._scan_row_logged = False
+        logger.info(
+            "SCAN_START: cx=%.2f cy=%.2f rx=%.2f ry=%.2f %dx%d speed=%d dir=%d "
+            "settle=%dms overshoot=%.2f payload=%s (%d bytes)",
+            params.cx_V, params.cy_V, params.range_x_V, params.range_y_V,
+            params.nx, params.ny, params.speed_pps, int(params.direction),
+            params.settle_ms, params.overshoot_V,
+            frame.payload.hex(), len(frame.payload),
         )
         self.transport.send(Cmd.SCAN_START, frame.payload)
 

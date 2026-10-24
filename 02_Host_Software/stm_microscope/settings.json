@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "saved_at": "2026-10-18 11:49:07",
+  "calibration": {
+    "tia_R": 100000000.0,
+    "x_nmV": 10.0,
+    "y_nmV": 10.0,
+    "z_nmV": 10.0
+  },
+  "approach": {
+    "step_pulse": 100,
+    "step_speed_sps": 1000,
+    "thresh_pre_nA": 0.1,
+    "thresh_lock_nA": 0.9,
+    "z_start_V": 0.0,
+    "z_speed_Vps": 1.0,
+    "max_steps": 100000,
+    "retry": 5,
+    "microstep": 16
+  },
+  "feedback_adv": {
+    "pid_freq": 1000,
+    "z_min": -15.0,
+    "z_max": 15.0,
+    "overcurrent": 10.0
+  },
+  "manual": {
+    "x_V": 0.0,
+    "y_V": 0.0,
+    "z_V": 0.0,
+    "step_n": 10,
+    "speed_sps": 2000,
+    "goto_target": 0,
+    "bias_V": 0.1
+  }
+}

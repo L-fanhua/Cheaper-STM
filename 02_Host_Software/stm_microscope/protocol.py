@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 FRAME_HEADER = b"\x55\xAA"   # 帧头 (注意：线序 0x55 0xAA)
 FRAME_TAIL = 0x0A            # 帧尾
-MAX_PAYLOAD = 1024           # 单帧 payload 上限
+MAX_PAYLOAD = 8200           # 单帧 payload 上限 (v1.1: 容纳 SCAN_ROW 整行 nx=1024 → 8+8*1024=8200)
 MIN_LENGTH = 3               # LENGTH 最小值 = cmd(1) + crc(2)
 MAX_LENGTH = MIN_LENGTH + MAX_PAYLOAD
 
@@ -380,7 +380,7 @@ class ScanRow:
         if len(payload) < 8:
             raise PayloadError(Reply.SCAN_ROW, -1, len(payload))
         y_idx, nx = struct.unpack("<HH", payload[:4])
-        expected = 8 + 8 * nx
+        expected = 4 + 8 * nx
         if len(payload) != expected:
             raise PayloadError(Reply.SCAN_ROW, expected, len(payload))
         I_data = list(struct.unpack(f"<{nx}f", payload[4:4 + 4 * nx]))
@@ -728,16 +728,23 @@ def set_bias(bias_V: float) -> Frame:
     return _make(Cmd.SET_BIAS, struct.pack("<f", bias_V))
 
 def step_motor(steps: int, speed_sps: int) -> Frame:
-    """STEP_MOTOR: 手动步进电机（steps 正=进，负=退）
+    """STEP_MOTOR: 手动步进电机（正向）
 
     Payload 布局 (6 字节)：
-        偏移 0  长度 2  字段 steps    i16   步数，带符号（正=进，负=退）
+        偏移 0  长度 2  字段 steps    i16   步数（打包 i16；正数与 u16 固件兼容）
         偏移 2  长度 4  字段 speed    u32   步进频率 (steps/s)
+
+    ⚠️ 当前固件按 u16 无符号解析 steps，不支持负数：
+    发送负数会被固件解读为巨大正数（如 -2000 → 63536 步）并长时间阻塞。
+    后退必须使用 retract_z()（RETRACT_Z 命令）。
     """
-    if steps == 0:
-        raise ValueError("steps must be non-zero")
-    if not -32768 <= steps <= 32767:
-        raise ValueError(f"steps {steps} out of [-32768, 32767]")
+    if steps <= 0:
+        raise ValueError(
+            f"steps {steps} 非法: 固件 STEP_MOTOR 按 u16 无符号解析, "
+            "不支持负数/零; 后退请使用 retract_z()"
+        )
+    if steps > 32767:
+        raise ValueError(f"steps {steps} out of (0, 32767]")
     if not 1 <= speed_sps <= 100000:
         raise ValueError(f"speed_sps {speed_sps} out of [1, 100000]")
     return _make(Cmd.STEP_MOTOR, struct.pack("<hI", steps, speed_sps))

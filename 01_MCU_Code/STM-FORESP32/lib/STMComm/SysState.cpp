@@ -47,6 +47,13 @@ uint8_t SysState::requestMode(uint8_t newMode) {
         return NACK_INVALID_TRANSITION;
     }
 
+    /* v1.5: 离开 scanning 时停止扫描状态机 (已收行数据保留在上位机) */
+    if (mode == MODE_SCANNING && newMode != MODE_SCANNING) {
+        scanActive = false;
+        scanPaused = false;
+        scanPhase  = SCAN_ROW_IDLE;
+    }
+
     mode = newMode;
     return 0;
 }
@@ -59,6 +66,9 @@ void SysState::emergencyStop(uint8_t cause) {
     /* z 全退 */
     retractZ();
     /* 停扫描 / 步进 */
+    scanActive = false;          /* v1.5: 停止扫描状态机 */
+    scanPaused = false;
+    scanPhase  = SCAN_ROW_IDLE;
     hw.stepStop();
     /* 进入 idle 锁定 */
     mode = MODE_IDLE;

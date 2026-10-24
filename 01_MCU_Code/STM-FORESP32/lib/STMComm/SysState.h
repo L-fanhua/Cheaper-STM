@@ -118,6 +118,17 @@ public:
     float    approachCurZ = 0.0f;        /* 细逼近当前 z 电压 */
     uint32_t approachLastTickMs = 0;     /* 上次 approach tick 时间 */
 
+    /* ---- Scan 运行时状态 (v1.5 恒高模式) ---- */
+    bool     scanActive = false;         /* 扫描是否正在执行 */
+    bool     scanPaused = false;         /* SCAN_PAUSE 暂停中 (位置保持) */
+    bool     scanDirReverse = false;     /* 当前行是否反向行 (backward/bidirectional) */
+    uint8_t  scanPhase = SCAN_ROW_IDLE;  /* 当前行阶段 */
+    uint16_t scanX = 0;                  /* 行内步序 0..nx-1 (含方向) */
+    uint16_t scanY = 0;                  /* 当前行号 0..ny-1 */
+    uint32_t scanPointsDone = 0;         /* 累计采集点数 */
+    uint32_t scanLastStepUs = 0;         /* 上个扫描点时间戳 (us) */
+    uint32_t scanSettleUntilMs = 0;      /* 行前 settle 截止时间 (ms) */
+
     /* ---- 实时测量值 (供 STATUS 上报) ---- */
     float    cur_I_nA = 0.0f;
     float    z_V = 0.0f;

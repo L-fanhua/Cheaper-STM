@@ -13,14 +13,19 @@ STM 上位机主窗口
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from typing import Optional
 
 import concurrent.futures
+import threading
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -30,8 +35,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from controller import STMController
-from protocol import DeviceError, ErrCode, FatalDeviceError, Mode, Status
+from controller import ScanParams, STMController, GotoCancelled
+from protocol import (
+    Cmd,
+    DeviceError,
+    ErrCode,
+    FatalDeviceError,
+    Mode,
+    NackError,
+    NackReason,
+    Status,
+)
 from scanner import ScanEngine, save_scan
 from transport import TransportConfig
 from ui.widgets import (
@@ -48,6 +62,9 @@ from ui.widgets import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 参数持久化: 固定文件 (启动自动恢复) + 另存为/打开的多套方案文件
+SETTINGS_FILE = "settings.json"
 
 
 def _friendly_async_error(e: Exception) -> str:
@@ -72,6 +89,10 @@ class _Bridge(QObject):
     scan_end = Signal(object)
     approach_data = Signal(object)
     approach_done = Signal(object)
+    # Approach 按钮状态复位（停止/兜底，不依赖固件回发 APPROACH_DONE）
+    approach_ui_reset = Signal()
+    # 归位按钮状态复位（完成/失败/取消后恢复）
+    goto_ui_reset = Signal()
     error = Signal(object)
     # 日志：正文（类别由 _on_log_main 根据内容自动推断）
     log = Signal(str)
@@ -111,6 +132,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._wire_callbacks()
         self._start_timer()
+        # 启动时自动恢复上次参数 (settings.json 不存在则跳过)
+        self._auto_load_settings()
 
     # -----------------------------------------------------------------
     # UI 构建
@@ -173,6 +196,10 @@ class MainWindow(QMainWindow):
         mid_layout.addWidget(self.progress)
         self.manual_bar = ManualControlBar()
         self.manual_bar.bind(self.controller)
+        # 步进电机归位（闭环, worker 线程执行, 运行中再点 = 停止）
+        self._goto_running = False
+        self._goto_cancel = threading.Event()
+        self.manual_bar.goto_btn.clicked.connect(self._on_goto_step)
         # 连接扫描模式信号到手动控制抽屉里的模式标签
         self.scan_fields.mode_changed.connect(self.manual_bar.set_mode_label)
         mid_layout.addWidget(self.manual_bar)
@@ -211,6 +238,8 @@ class MainWindow(QMainWindow):
         self.bridge.scan_end.connect(self._on_scan_end_main)
         self.bridge.approach_data.connect(self._on_approach_data_main)
         self.bridge.approach_done.connect(self._on_approach_done_main)
+        self.bridge.approach_ui_reset.connect(self._on_approach_ui_reset)
+        self.bridge.goto_ui_reset.connect(self._on_goto_ui_reset)
         self.bridge.error.connect(self._on_error_main)
         self.bridge.log.connect(self._on_log_main)
         self.bridge.frame_log.connect(self._on_frame_log_main)
@@ -240,12 +269,21 @@ class MainWindow(QMainWindow):
         self.settings_fields.save_requested.connect(self._run_async(self.controller.save_calibration))
         self.settings_fields.load_requested.connect(self._run_async(self.controller.load_calibration))
 
+        # 参数文件 (设置栏 + 手动控制 持久化)
+        self.settings_fields.settings_store.connect(self._on_settings_store)
+        self.settings_fields.settings_load.connect(self._on_settings_load)
+        self.settings_fields.settings_saveas.connect(self._on_settings_saveas)
+        self.settings_fields.settings_open.connect(self._on_settings_open)
+
         # 图像保存
         self.image_panel.save_requested.connect(self._on_save)
 
         # Approach 启停（启停按钮在 ScanFields 顶部，参数从 SettingsFields 取）
         self.scan_fields.approach_start_btn.clicked.connect(self._on_approach_start)
-        self.scan_fields.approach_stop_btn.clicked.connect(self._run_async(self.controller.stop_approach))
+        self.scan_fields.approach_stop_btn.clicked.connect(self._on_approach_stop)
+
+        # 扫描启动: 初始化数据引擎 + 同步示波器 (bind() 发命令前 emit)
+        self.scan_fields.start_requested.connect(self._on_scan_start_requested)
 
     # -----------------------------------------------------------------
     # 定时刷新
@@ -280,7 +318,35 @@ class MainWindow(QMainWindow):
         self.scan_engine.on_end(end.total_points)
         self.scan_fields.set_running(False)
         self.progress.setValue(100)
-        self.bridge.log.emit(f"[扫描完成] 总点数 {end.total_points}")
+        img = self.scan_engine.snapshot()
+        rows = img.rows_received if img is not None else 0
+        ny = img.ny if img is not None else 0
+        if rows == 0:
+            self.bridge.log.emit(
+                f"[扫描完成] 总点数 {end.total_points} — "
+                "⚠️ 未收到任何扫描行 (SCAN_ROW 0x91)! 图像为空。"
+                "固件可能未实现扫描数据上报, 请检查固件 SCAN_ROW 发送逻辑"
+            )
+        else:
+            self.bridge.log.emit(
+                f"[扫描完成] 总点数 {end.total_points} | 图像 {rows}/{ny} 行"
+            )
+
+    def _on_scan_start_requested(self, params: ScanParams) -> None:
+        """扫描启动前（命令发送前）：初始化数据引擎 + 同步示波器宽度"""
+        calib = self.controller.calibration
+        if not self.controller.calib_loaded or not calib.is_valid():
+            self.bridge.log.emit(
+                "[扫描] 警告: 标定未应用, 图像 nm 换算将使用无效默认值 "
+                "(请先在「设置」栏应用标定)"
+            )
+        self.scan_engine.start_scan(params, calib)
+        self.osc_panel.set_scan_params(params.nx)
+        self.bridge.log.emit(
+            f"[扫描] 引擎就绪: {params.nx}×{params.ny}, "
+            f"中心 ({params.cx_V:.2f}, {params.cy_V:.2f})V, "
+            f"范围 {params.range_x_V:.2f}×{params.range_y_V:.2f}V"
+        )
 
     def _on_approach_data_main(self, d) -> None:
         # Approach 数据走日志（右栏示波器专用于扫描行）
@@ -448,7 +514,23 @@ class MainWindow(QMainWindow):
                         "如步数提前停止请将最大步数降至 ≤65535 或更新固件"
                     )
                 self.controller.set_mode(Mode.APPROACH)
-                self.controller.start_approach(params)
+                try:
+                    self.controller.start_approach(params)
+                except NackError as e:
+                    # 固件拒绝 u32 新格式 → 自动降级为 u16 兼容格式重试,
+                    # 使固件未更新/半更新时 approach 仍可工作 (见 FIRMWARE_PATCH.md)
+                    if (params.max_steps > 65535
+                            and e.cmd == int(Cmd.APPROACH_START)
+                            and e.reason == NackReason.PARAM_OUT_OF_RANGE):
+                        self.bridge.log.emit(
+                            f"[Approach] 固件拒绝了 u32 新格式 ({e})，"
+                            f"自动降级 max_steps={params.max_steps}→65535 (u16 兼容格式) 重试；"
+                            "如需更大上限请按 FIRMWARE_PATCH.md 更新固件"
+                        )
+                        params.max_steps = 65535
+                        self.controller.start_approach(params)
+                    else:
+                        raise
                 self.bridge.log.emit("[Approach] 已启动")
             except Exception as e:
                 self.bridge.log.emit(f"[Approach] 启动失败: {e}")
@@ -457,6 +539,136 @@ class MainWindow(QMainWindow):
                               "final_current_nA": 0.0})())
         self._run_async(work)()
         self.scan_fields.set_approach_running(True)
+
+    def _on_approach_stop(self) -> None:
+        """停止 approach：发送停止命令后立即恢复启停按钮，
+        不依赖固件回发 APPROACH_DONE（部分固件停止后不上报该帧，
+        会导致「开始 Approach」按钮永远灰色）。"""
+        def work():
+            try:
+                self.controller.stop_approach()
+                self.bridge.log.emit("[Approach] 停止命令已发送")
+            except Exception as e:
+                self.bridge.log.emit(f"[Approach] 停止失败: {e}")
+            finally:
+                # 无论停止命令成败，都恢复启停按钮，避免「开始」永远灰色
+                self.bridge.approach_ui_reset.emit()
+        self._run_async(work)()
+
+    def _on_approach_ui_reset(self) -> None:
+        """主线程槽：仅复位 Approach 启停按钮状态"""
+        self.scan_fields.set_approach_running(False)
+
+    def _on_goto_step(self) -> None:
+        """归位到指定步（闭环）；运行中再次点击 = 停止"""
+        if self._goto_running:
+            self._goto_cancel.set()
+            self.bridge.log.emit("[归位] 收到停止请求，将在本批结束后停止…")
+            return
+        target = self.manual_bar.goto_target_spin.value()
+        speed = self.manual_bar.speed_spin.value()
+        self._goto_cancel = threading.Event()
+        self._goto_running = True
+        self.manual_bar.set_goto_running(True)
+        self.bridge.log.emit(f"[归位] 启动: 目标 {target} 步, 速度 {speed} sps (后退批次会将 z 归 z_min)")
+
+        def work():
+            try:
+                def progress(cur: int, tgt: int) -> None:
+                    self.bridge.log.emit(f"[归位] 当前 {cur} → 目标 {tgt}")
+                pos = self.controller.goto_step(
+                    target, speed, cancel=self._goto_cancel, progress=progress
+                )
+                self.bridge.log.emit(f"[归位] 完成: 到达 {pos} (目标 {target})")
+            except GotoCancelled:
+                cur = self.controller.current_step
+                self.bridge.log.emit(f"[归位] 已停止于 {cur}")
+            except Exception as e:
+                self.bridge.log.emit(f"[归位] 失败: {e}")
+            finally:
+                self.bridge.goto_ui_reset.emit()
+        self._run_async(work)()
+
+    def _on_goto_ui_reset(self) -> None:
+        """主线程槽：恢复归位按钮"""
+        self._goto_running = False
+        self.manual_bar.set_goto_running(False)
+
+    # -----------------------------------------------------------------
+    # 参数文件 (设置栏 + 手动控制, 跨面板持久化)
+    # -----------------------------------------------------------------
+
+    def _collect_all_settings(self) -> dict:
+        data = {
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        data.update(self.settings_fields.config_dict())
+        data.update(self.manual_bar.config_dict())
+        return data
+
+    def _apply_all_settings(self, data: dict) -> None:
+        self.settings_fields.load_config_dict(data)
+        self.manual_bar.load_config_dict(data)
+
+    def _on_settings_store(self) -> None:
+        """存储: 写入固定文件 settings.json (启动时自动恢复)"""
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._collect_all_settings(), f, ensure_ascii=False, indent=2)
+            self.bridge.log.emit(f"[设置] 已存储到 {SETTINGS_FILE} (下次启动自动恢复)")
+        except Exception as e:
+            QMessageBox.warning(self, "存储失败", str(e))
+
+    def _on_settings_load(self) -> None:
+        """读取: 从 settings.json 恢复界面参数"""
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._apply_all_settings(data)
+            self.bridge.log.emit(f"[设置] 已从 {SETTINGS_FILE} 恢复参数 (仅界面值, 需手动应用)")
+        except FileNotFoundError:
+            self.bridge.log.emit(f"[设置] {SETTINGS_FILE} 不存在, 先点「存储」生成")
+        except Exception as e:
+            QMessageBox.warning(self, "读取失败", str(e))
+
+    def _on_settings_saveas(self) -> None:
+        """另存为…: 保存多套参数方案"""
+        default = time.strftime("settings_%Y%m%d_%H%M%S.json")
+        path, _ = QFileDialog.getSaveFileName(self, "另存参数方案", default, "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._collect_all_settings(), f, ensure_ascii=False, indent=2)
+            self.bridge.log.emit(f"[设置] 已另存到 {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "另存失败", str(e))
+
+    def _on_settings_open(self) -> None:
+        """打开…: 载入参数方案文件"""
+        path, _ = QFileDialog.getOpenFileName(self, "打开参数方案", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._apply_all_settings(data)
+            self.bridge.log.emit(f"[设置] 已从 {path} 载入参数 (仅界面值, 需手动应用)")
+        except Exception as e:
+            QMessageBox.warning(self, "打开失败", str(e))
+
+    def _auto_load_settings(self) -> None:
+        """启动时自动恢复上次参数 (settings.json)"""
+        if not os.path.exists(SETTINGS_FILE):
+            return
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._apply_all_settings(data)
+            self.bridge.log.emit(f"[设置] 已自动恢复上次参数 ({SETTINGS_FILE})")
+        except Exception:
+            logger.exception("自动恢复设置失败")
 
     def _on_save(self) -> None:
         img = self.scan_engine.snapshot()

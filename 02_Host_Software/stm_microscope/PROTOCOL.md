@@ -29,7 +29,7 @@
 ```
 
 - **总帧长** = 7 + N = 7 + (LENGTH - 3) = LENGTH + 4
-- **LENGTH 范围** = 3 (无 payload) ~ 1027 (payload 1024B)
+- **LENGTH 范围** = 3 (无 payload) ~ 8203 (payload 8200B, v1.1: 为 SCAN_ROW 整行传输扩容)
 
 ### 2.1 CRC-16/MODBUS 参数
 
@@ -53,7 +53,7 @@ HEADER_1:
     收到 0xAA → 进入 READ_LENGTH
     否则回 SEARCH_HEADER
 READ_LENGTH:
-    收满 2 字节 → 校验 LENGTH 范围 [3, 1027]
+    收满 2 字节 → 校验 LENGTH 范围 [3, 8203]
         合法 → 进入 READ_BODY (读取 LENGTH 字节)
         非法 → 回 SEARCH_HEADER，记录错误 FRAME_LENGTH_INVALID
 READ_BODY:
@@ -105,7 +105,7 @@ READ_BODY:
 | 0x81 | PONG             | 0            | 心跳响应 |
 | 0x82 | FW_VERSION       | 不定长       | 固件版本号 (ASCII) |
 | 0x90 | STATUS           | 22           | 周期上报状态 (50~100Hz) |
-| 0x91 | SCAN_ROW         | 8 + 8*nx     | 整行扫描数据 |
+| 0x91 | SCAN_ROW         | 4 + 8*nx     | 整行扫描数据 |
 | 0x92 | SCAN_END         | 4            | 扫描完成 |
 | 0x93 | APPROACH_DATA    | 9            | approach 过程数据 |
 | 0x94 | APPROACH_DONE    | 9            | approach 结束 |
@@ -412,7 +412,7 @@ PHASE_FINE (DAC 细逼近):
 
 **注意**：
 - 双向扫描时，反向行的数据顺序仍按 x_idx 升序排列 (下位机负责重排)
-- 单帧最大 payload = 8 + 8*2048 = 16488 字节，超出 LENGTH 上限 → nx 限制为 1024
+- 单行 payload = 4 + 8×nx (v1.1 修正: 头部 4 字节; MAX_PAYLOAD=8200 ≥ 4+8×1024=8196, 一行一帧, 支持 nx ≤ 1024)
 
 ### 5.3 SCAN_END (0x92)
 

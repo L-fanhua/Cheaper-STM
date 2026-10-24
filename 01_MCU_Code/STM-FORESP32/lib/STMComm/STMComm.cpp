@@ -10,6 +10,11 @@
 /* 通信超时阈值 (ms) */
 #define COMM_TIMEOUT_MS  5000
 
+/* ---- 扫描参数 (v1.5 恒高模式) ---- */
+#define SCAN_POINT_SETTLE_US       50    /* 点内建立时间: DAC 输出后短暂等待再采样 */
+#define SCAN_POINT_MIN_INTERVAL_US 100   /* 最小点间隔 (最高 10k pps, 与协议上限一致) */
+#define SCAN_MAX_CATCHUP           10    /* 落后超过 N 个点间隔则重同步, 不追帧 */
+
 STMComm::STMComm(SysState &state) : _port(nullptr), _sys(state) {}
 
 void STMComm::begin(Stream &port) {
@@ -49,6 +54,11 @@ void STMComm::tick() {
     /* Approach 状态机驱动 (v1.3): 每个周期执行单步逼近 */
     if (_sys.approachActive) {
         approachTick();
+    }
+
+    /* Scan 状态机驱动 (v1.5 恒高): 逐点采集, 按行上报 */
+    if (_sys.scanActive && !_sys.scanPaused) {
+        scanTick();
     }
 
     /* STATUS 周期上报 (50 Hz) */
@@ -276,17 +286,31 @@ void STMComm::dispatch(uint8_t cmd, const uint8_t *p, uint16_t n) {
             return;
         }
         case CMD_SCAN_STOP:
-            /* 桩: 停止扫描, 切回 feedback */
+            /* v1.5: 停止扫描状态机, 已收行保留在上位机, 切回 feedback */
+            _sys.scanActive = false;
+            _sys.scanPaused = false;
+            _sys.scanPhase  = SCAN_ROW_IDLE;
             _sys.mode = MODE_FEEDBACK;
             sendAck(cmd);
             return;
         case CMD_SCAN_PAUSE:
-            /* 桩 */
-            sendAck(cmd);
+            /* v1.5: 暂停扫描, 当前位置/DAC 输出保持 */
+            if (_sys.scanActive && !_sys.scanPaused) {
+                _sys.scanPaused = true;
+                sendAck(cmd);
+            } else {
+                sendNack(cmd, NACK_INVALID_TRANSITION);
+            }
             return;
         case CMD_SCAN_RESUME:
-            /* 桩 */
-            sendAck(cmd);
+            /* v1.5: 从暂停恢复, 重置节拍基准 (防止恢复瞬间追帧) */
+            if (_sys.scanActive && _sys.scanPaused) {
+                _sys.scanPaused = false;
+                _sys.scanLastStepUs = micros();
+                sendAck(cmd);
+            } else {
+                sendNack(cmd, NACK_INVALID_TRANSITION);
+            }
             return;
 
         /* ---- Approach ---- */
@@ -482,8 +506,23 @@ uint8_t STMComm::handleScanStart(const uint8_t *p, uint16_t n) {
     if (yLo < XY_VOLT_MIN || yHi > XY_VOLT_MAX)           return NACK_PARAM_OUT_OF_RANGE;
 
     _sys.scan = s;
+
+    /* v1.5: 恒高模式扫描已实现; 恒流模式依赖 PID 反馈环 (未实现), 拒绝启动 */
+    if (_sys.scan_mode != SCAN_MODE_CONSTANT_HEIGHT) {
+        return NACK_INTERNAL_ERROR;
+    }
+
+    /* 启动扫描状态机 (恒高: z 保持当前电压不动) */
     _sys.mode = MODE_SCANNING;
-    /* 实际扫描执行由上层任务驱动 (桩: 此处仅记录参数) */
+    _sys.scanActive     = true;
+    _sys.scanPaused     = false;
+    _sys.scanDirReverse = (s.direction == SCAN_BACKWARD);
+    _sys.scanPhase      = SCAN_ROW_IDLE;
+    _sys.scanX          = 0;
+    _sys.scanY          = 0;
+    _sys.scanPointsDone = 0;
+    for (uint16_t k = 0; k < s.nx; k++) _scanRowZ[k] = _sys.z_V;  /* z 常量数组 */
+    startRowPresettle();   /* 首行: 端点预压 + settle */
     return 0;
 }
 
@@ -528,10 +567,22 @@ uint8_t STMComm::handleApproachStart(const uint8_t *p, uint16_t n) {
     a.retry          = p[i];          i += 1;
     a.microstep      = rd_u16(&p[i]); i += 2;
 
-    if (a.step_speed_sps == 0) return NACK_PARAM_OUT_OF_RANGE;
-    if (a.max_steps == 0)     return NACK_PARAM_OUT_OF_RANGE;
-    if (a.thresh_pre_nA < 0 || a.thresh_lock_nA < 0) return NACK_PARAM_OUT_OF_RANGE;
-    if (a.z_start_V < _sys.z_min || a.z_start_V > _sys.z_max) return NACK_PARAM_OUT_OF_RANGE;
+    /* v1.6: 参数校验补全 (FIRMWARE_PATCH.md 修改点 2, 协议 v1.1)
+     *   step_pulse ∈ [1,65535] (u16 天然上限)
+     *   step_speed ∈ [1,100000]
+     *   0 ≤ thresh_pre < thresh_lock ≤ 100
+     *   max_steps ∈ [1,1000000] (u32, v1.1 放宽, 原 65535)
+     *   z_speed ∈ (0,100]
+     *   microstep ∈ {1,2,4,8,16,32,64,128,256} */
+    if (a.step_pulse < 1)                                        return NACK_PARAM_OUT_OF_RANGE;
+    if (a.step_speed_sps < 1 || a.step_speed_sps > 100000UL)     return NACK_PARAM_OUT_OF_RANGE;
+    if (a.thresh_pre_nA < 0.0f || a.thresh_lock_nA > 100.0f)     return NACK_PARAM_OUT_OF_RANGE;
+    if (a.thresh_pre_nA >= a.thresh_lock_nA)                     return NACK_PARAM_OUT_OF_RANGE;
+    if (a.max_steps < 1 || a.max_steps > 1000000UL)              return NACK_PARAM_OUT_OF_RANGE;
+    if (a.z_speed_Vps <= 0.0f || a.z_speed_Vps > 100.0f)         return NACK_PARAM_OUT_OF_RANGE;
+    if (a.microstep < 1 || a.microstep > 256 ||
+        (a.microstep & (a.microstep - 1)) != 0)                  return NACK_PARAM_OUT_OF_RANGE;
+    if (a.z_start_V < _sys.z_min || a.z_start_V > _sys.z_max)    return NACK_PARAM_OUT_OF_RANGE;
 
     _sys.approach = a;
     /* v1.3: 启动 approach 状态机 */
@@ -701,5 +752,118 @@ void STMComm::approachTick() {
         approachStepCoarse(_sys, this);
     } else {
         approachStepFine(_sys, this);
+    }
+}
+
+/* ================================================================== *
+ *  Scan 状态机 (v1.5 恒高模式)
+ *
+ *  恒高: z 固定不动, 逐点输出 x/y 电压, 采集隧道电流 I
+ *  流程: 每行 → 端点预压(overshoot) → settle_ms → 逐点采集 → SCAN_ROW
+ *        全部行完成 → SCAN_END, 模式切回 FEEDBACK
+ *
+ *  节拍: 点间隔 = 1/speed_pps; tick 周期 (~1ms) 内按到期补点,
+ *        落后超过 SCAN_MAX_CATCHUP 个点间隔时重同步 (不追帧防 burst)
+ *  方向: backward 整体反向; bidirectional 偶数行正向/奇数行反向,
+ *        反向行数据仍按 x 升序存放 (协议 5.2, 下位机负责重排)
+ * ================================================================== */
+
+/* 新行开始: 输出行起点预压电压 (压电迟滞补偿), 进入 settle 阶段 */
+void STMComm::startRowPresettle() {
+    const ScanParams &s = _sys.scan;
+
+    /* 行起点 (考虑行方向): 正向 lo→hi, 反向 hi→lo */
+    float xBegin = _sys.scanDirReverse ? (s.cx + s.range_x / 2.0f)
+                                       : (s.cx - s.range_x / 2.0f);
+
+    /* 预压: 沿行进方向向外推 overshoot_V (applyXyz 会钳位到 ±15V) */
+    float xOver = xBegin + (_sys.scanDirReverse ? s.overshoot_V : -s.overshoot_V);
+
+    float y = s.cy;
+    if (s.ny > 1) {
+        y += ((float)_sys.scanY / (float)(s.ny - 1) - 0.5f) * s.range_y;
+    }
+
+    _sys.applyXyz(xOver, y, _sys.z_V);       /* 恒高: z 保持 */
+    _sys.scanPhase         = SCAN_ROW_SETTLE;
+    _sys.scanSettleUntilMs = millis() + s.settle_ms;
+}
+
+/* 采集单个点: 输出 (x, y) → 点内短建立 → 采 I (存入 x 升序位置) */
+void STMComm::doScanPoint() {
+    const ScanParams &s = _sys.scan;
+
+    /* 物理列索引: 反向行步序镜像, 保证行缓冲始终按 x 升序 */
+    uint16_t col = _sys.scanDirReverse ? (uint16_t)(s.nx - 1 - _sys.scanX)
+                                       : _sys.scanX;
+
+    float x = s.cx;
+    if (s.nx > 1) {
+        x += ((float)col / (float)(s.nx - 1) - 0.5f) * s.range_x;
+    }
+    float y = s.cy;
+    if (s.ny > 1) {
+        y += ((float)_sys.scanY / (float)(s.ny - 1) - 0.5f) * s.range_y;
+    }
+
+    _sys.applyXyz(x, y, _sys.z_V);           /* 恒高: z 保持当前值 */
+    delayMicroseconds(SCAN_POINT_SETTLE_US); /* 点内短建立, 提高采样质量 */
+
+    float I = _sys.hw.adcReadI();
+    _sys.cur_I_nA = I;
+    _scanRowI[col] = I;
+    _sys.scanPointsDone++;
+    _sys.scanX++;
+
+    /* 行完成 → 上报本行 */
+    if (_sys.scanX >= s.nx) {
+        sendScanRow(_sys.scanY, s.nx, _scanRowI, _scanRowZ);
+        _sys.scanX = 0;
+        _sys.scanY++;
+
+        if (_sys.scanY >= s.ny) {
+            /* 全部完成 */
+            _sys.scanActive = false;
+            _sys.scanPhase  = SCAN_ROW_IDLE;
+            _sys.mode       = MODE_FEEDBACK;
+            sendScanEnd(_sys.scanPointsDone);
+            return;
+        }
+
+        /* 下一行方向: 双向模式奇数行反向 */
+        _sys.scanDirReverse =
+            (s.direction == SCAN_BIDIRECTIONAL) ? (uint8_t)(_sys.scanY & 1)
+                                                : (uint8_t)(s.direction == SCAN_BACKWARD);
+        startRowPresettle();
+    }
+}
+
+/* 扫描调度: settle 阶段切换 + 按点间隔补点到期点 */
+void STMComm::scanTick() {
+    const ScanParams &s = _sys.scan;
+
+    /* 行前 settle 阶段: 到时间后进入采集 */
+    if (_sys.scanPhase == SCAN_ROW_SETTLE) {
+        if ((int32_t)(millis() - _sys.scanSettleUntilMs) < 0) return;
+        _sys.scanPhase      = SCAN_ROW_SCAN;
+        _sys.scanLastStepUs = micros();
+    }
+
+    /* 点间隔 (us), 下限钳位 */
+    uint32_t intervalUs = 1000000UL / s.speed_pps;
+    if (intervalUs < SCAN_POINT_MIN_INTERVAL_US) intervalUs = SCAN_POINT_MIN_INTERVAL_US;
+
+    /* 到期补点 (tick 周期 > 点间隔时每周期处理多个点) */
+    while (_sys.scanActive) {
+        if (_sys.scanPhase != SCAN_ROW_SCAN) return;   /* 行切换, 等下个周期 */
+        uint32_t nowUs = micros();
+        uint32_t dt    = nowUs - _sys.scanLastStepUs;
+        if (dt < intervalUs) return;
+        if (dt > SCAN_MAX_CATCHUP * intervalUs) {
+            _sys.scanLastStepUs = nowUs;   /* 落后过多: 重同步, 不追帧 */
+        } else {
+            _sys.scanLastStepUs += intervalUs;
+        }
+        doScanPoint();
     }
 }
